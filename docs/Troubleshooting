@@ -664,3 +664,191 @@ build_flags =
 	-DSMOOTH_FONT=1
 	-DSPI_FREQUENCY=27000000
 ```
+
+# Phase 2 — Troubleshooting, Partie D
+
+**Sujet :** Alimentation externe de l'ESP32 et defaillance du bus I2C
+ 
+---
+ 
+## D.1 — Regulateurs abaisseurs MP1584EN : defaillance materielle
+ 
+### Symptome
+ 
+Deux modules MP1584EN acquis en lot. Sur les deux unites, le potentiometre d'ajustement
+ne produit aucune variation mesurable de la tension de sortie. La tension d'entree est
+confirmee correcte (6,9 V mesures aux bornes VIN, provenant de la LiPo 2S).
+ 
+Sur la premiere unite, un degagement de fumee est survenu en cours de test.
+ 
+### Diagnostic
+ 
+Tension d'entree validee au multimetre : conforme.
+Rotation du potentiometre sur toute sa course : variation de sortie inferieure a 0,01 V.
+Comportement reproduit sur la seconde unite du meme lot.
+ 
+Conclusion : defaut de fabrication sur le lot. L'etage de retroaction des modules ne
+repond pas. Ce mode de defaillance est documente sur les clones bon marche de ce
+composant.
+ 
+### Resolution
+ 
+Remplacement par un module LM2596 muni d'un afficheur numerique integre. Le retour
+visuel de la tension de sortie permet un reglage direct, sans passer par une mesure
+externe a chaque increment.
+ 
+Reglage obtenu : 3,37 V, stable, dans la plage acceptable de l'ESP32 (3,0 - 3,6 V).
+ 
+### Lecon retenue
+ 
+Sur un etage d'alimentation, privilegier un module a retour visuel integre. Le cout
+supplementaire est negligeable devant le temps de diagnostic economise, et l'absence
+de retour rend impossible la distinction entre un module defectueux et une erreur de
+manipulation.
+ 
+---
+ 
+## D.2 — Court-circuit : destruction du Raspberry Pi et de l'ESP32
+ 
+### Symptome
+ 
+Suite a la defaillance du MP1584EN, le Raspberry Pi presente une LED rouge fixe sans
+clignotement de la LED verte d'activite. L'ESP32 ne demarre plus.
+ 
+### Diagnostic
+ 
+Inspection visuelle de la breadboard : zone de brulure visible au centre de la plaque,
+correspondant a l'emplacement du module defaillant.
+ 
+Le module MP1584EN etait monte sur la meme breadboard que le Raspberry Pi et l'ESP32
+au moment de la defaillance. Les rails d'alimentation de la plaque etaient partages.
+ 
+Conclusion : la defaillance du regulateur a propage une surtension sur les rails
+communs, endommageant les deux cartes.
+ 
+### Resolution
+ 
+Remplacement du Raspberry Pi 4B et de l'ESP32 TTGO T-Display.
+La section brulee de la breadboard est retiree du montage : les rails internes sont
+susceptibles d'etre endommages et ne peuvent plus etre consideres comme fiables.
+ 
+### Lecon retenue
+ 
+Un etage d'alimentation non valide ne doit jamais partager les rails d'une breadboard
+avec des cartes de calcul. La procedure corrigee est la suivante :
+ 
+1. Valider le regulateur seul, charge fictive en sortie, aucune carte connectee.
+2. Confirmer la tension de sortie stable sur toute la duree du test.
+3. Connecter la charge reelle seulement apres validation.
+Le cout de l'omission de cette procedure : deux cartes detruites.
+ 
+---
+ 
+
+ 
+## D.3 — Bus I2C : perte de communication avec le module Hiwonder
+ 
+### Symptome
+ 
+`i2cdetect -y 1` retourne une grille vide : l'adresse 0x34 du module Hiwonder
+n'apparait plus.
+ 
+Le script Python echoue a la premiere ecriture :
+ 
+```
+TimeoutError: [Errno 110] Connection timed out
+  bus.write_byte_data(I2C_ADDR, MOTOR_TYPE_ADDR, 3)
+```
+ 
+### Diagnostic
+ 
+Elements ecartes successivement :
+ 
+| Hypothese | Verification | Resultat |
+|---|---|---|
+| I2C desactive sur l'OS | `ls /dev/i2c-*` | Bus present, ecarte |
+| Module non alimente | LED du Hiwonder, tension LiPo | 7,6 V, alimente, ecarte |
+| Etage d'entree grille | Continuite SDA-GND et SCL-GND | Aucun court, ecarte |
+| Cablage SDA/SCL incorrect | Inspection | Conforme, ecarte |
+ 
+L'element determinant : **le bus fonctionne lorsque le cable USB de l'ESP32 est
+branche, et cesse de fonctionner des qu'il est retire.**
+ 
+Le cable USB etablissait une masse commune entre le Raspberry Pi et le reste du
+montage par un chemin parallele. Ce chemin masquait un defaut de contact sur la
+liaison de masse dediee entre le Raspberry Pi et le module Hiwonder.
+ 
+### Resolution
+ 
+Refection de la liaison de masse Raspberry Pi (pin 6, GND) vers le connecteur GND du
+module Hiwonder, en connexion directe, sans transiter par la breadboard.
+ 
+### Lecon retenue
+ 
+Sur un bus I2C, une masse commune defaillante ne produit pas une panne franche mais
+un comportement intermittent, dependant des autres chemins de masse presents dans le
+montage. Un symptome qui apparait et disparait selon qu'un cable non lie au bus est
+branche ou non pointe vers un probleme de masse, pas vers un probleme de signal.
+ 
+Ce mode de defaillance avait deja ete rencontre en Phase 2 sur la liaison UART. Il
+s'agit du meme defaut, sur le meme montage.
+ 
+---
+ 
+## D4 — Commandes d'arret non appliquees
+ 
+### Symptome
+ 
+Le terminal du Raspberry Pi affiche `Left: 0, Right: 0`, indiquant que la consigne
+nulle a ete calculee, mais les moteurs poursuivent leur rotation.
+ 
+### Diagnostic
+ 
+Deux causes distinctes, presentes simultanement.
+ 
+**Cause 1 — zone morte insuffisante.** La zone morte du joystick etait fixee a 2500
+sur une plage de 65536, soit moins de 4 % de la course. La derive residuelle de l'axe
+horizontal au repos depassait ce seuil, produisant une consigne de rotation non nulle
+alors que le joystick etait relache.
+ 
+**Cause 2 — ecritures I2C perdues.** En raison du defaut de masse decrit en D.4, une
+partie des ecritures I2C echouait de maniere intermittente. Le script capturait
+l'exception, mais le module conservait la derniere consigne valide recue. Une
+commande d'arret perdue laissait donc les moteurs en mouvement.
+ 
+### Resolution
+ 
+Cote ESP32 : zone morte portee de 2500 a 6000, appliquee sur chaque axe brut avant le
+melange des consignes. Ajout d'une garde sur la calibration : si le centre calcule
+s'ecarte de plus de 8000 de la valeur mediane, la calibration est rejetee et
+recommencee, afin d'eviter de calibrer sur un joystick pousse.
+ 
+Cote Raspberry Pi : la commande d'arret est reemise jusqu'a confirmation d'ecriture.
+Ajout d'un failsafe : en l'absence de trame UART pendant plus de 200 ms, les moteurs
+sont arretes. Sans ce mecanisme, une interruption de la liaison laissait les moteurs
+a leur derniere consigne indefiniment.
+ 
+### Lecon retenue
+ 
+Une commande d'arret ne doit jamais etre traitee comme une commande ordinaire. Elle
+doit etre reemise jusqu'a confirmation, et un mecanisme de repli independant doit
+garantir l'arret en cas de perte de communication. Un systeme mobile dont l'arret
+depend d'une trame qui peut se perdre n'est pas sur.
+ 
+---
+ 
+## Synthese
+ 
+Cinq defaillances traitees, dont trois d'origine materielle et deux d'origine
+logicielle. La cause racine commune aux incidents D.2, D.4 et D.5 est l'absence de
+procedure de validation isolee des etages d'alimentation, et la fragilite des
+liaisons de masse sur breadboard.
+ 
+Actions correctives permanentes retenues :
+ 
+- Tout etage d'alimentation est valide seul, sous charge fictive, avant connexion a
+  une carte de calcul.
+- Les liaisons de masse sont etablies en connexion directe, sans transiter par une
+  breadboard.
+- Toute commande d'arret est reemise jusqu'a confirmation, et doublee d'un failsafe
+  independant.
