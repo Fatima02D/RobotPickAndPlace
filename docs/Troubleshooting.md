@@ -5,13 +5,6 @@
 
 ---
 
-## Philosophie
-
-En ingénierie, un problème n'est pas un échec. C'est une donnée. Chaque obstacle
-rencontré ici a mené à une meilleure décision.
-
----
-
 # Partie A — Plateforme 2WD, plaque en bois (Janvier 2026)
 
 ## A1 — Moteurs immobiles au départ
@@ -555,6 +548,259 @@ convertisseur alimenté par une LiPo 50C.
 que le rail 5V du RPi peut fournir. Ils sont alimentés directement par le Pin 2 (5V) et un
 pin GND du RPi, ce qui garantit aussi la masse commune avec le reste du montage.
 
+# Partie F — Phase 4, logique d'évitement (Octobre 2026)
+
+## F1 — Destruction du contrôleur moteur Hiwonder par régulateur défaillant
+
+L'adresse I2C `0x34` du contrôleur moteur, détectée et fonctionnelle depuis la Phase 1, a
+cessé d'apparaître au balayage du bus. Le MPU6050 restait visible à `0x68`, ce qui excluait
+une panne globale du bus.
+
+**Diagnostic, étape par étape.**
+
+La LiPo était acheminée vers le Hiwonder à travers deux plaques d'essai successives.
+Première correction : raccordement direct de la batterie au port PWR de la carte par un
+adaptateur Deans vers JST.
+
+Mesure ensuite effectuée sur le port I2C de la carte, batterie seule raccordée, rien
+d'autre connecté :
+
+```
+broche 5V du port I2C ↔ GND : 7 V
+```
+
+Une broche étiquetée 5 V délivrant la tension brute de la batterie signifie une seule
+chose : le régulateur interne de la carte est détruit, entrée court-circuitée sur sortie.
+
+Les lignes de signal, mesurées séparément, étaient saines :
+
+```
+SCL ↔ GND : 200 mV
+SDA ↔ GND : 195 mV
+```
+
+Vérification finale avec SDA, SCL et GND seuls raccordés, la broche 5 V laissée libre :
+
+```
+i2cdetect -y 1  →  les 112 adresses répondent
+```
+
+Cent douze périphériques n'existent pas. C'est la signature d'une ligne SDA bloquée à
+l'état bas : chaque adresse interrogée paraît acquittée. Hiwonder retiré, le balayage
+redevient propre.
+
+**Verdict :** contrôleur I2C de la carte détruit, carte irrécupérable.
+
+**Portée rétrospective.** Cette défaillance explique également la destruction du premier
+Raspberry Pi, attribuée jusque-là à un court-circuit de câblage (B6). Une broche annoncée à
+5 V qui délivre 7,4 V alimentait les entrées GPIO limitées à 3,3 V.
+
+**Leçon :** une broche d'alimentation d'un module tiers se mesure avant tout raccordement,
+même et surtout lorsqu'elle est étiquetée. L'étiquette décrit l'intention du concepteur,
+pas l'état du composant. Sur la carte de remplacement, mesurer la broche 5 V du port I2C
+avant la première connexion : 7 V signifie carte défectueuse à l'arrivée, à retourner.
+
+**Règles permanentes établies à la suite de cet incident :**
+
+- La broche 5 V du port I2C du Hiwonder n'est raccordée à rien. Trois fils seulement :
+  SDA, SCL, GND.
+- La LiPo rejoint le port PWR du Hiwonder en direct, jamais à travers une plaque d'essai.
+- Le VCC du MPU6050 reste sur la broche 1 du RPi (3,3 V), jamais sur le convertisseur.
+- La sortie négative du convertisseur rejoint le rail de masse commune.
+- Le RPi est alimenté par la batterie externe via USB-C, jamais par les broches GPIO.
+- Le convertisseur est réglé à 5,0 V, mesuré à vide, avant tout raccordement.
+
+## F2 — Erreur `GPIO not allocated` persistante
+
+Le script de test des capteurs à ultrasons, écrit avec `RPi.GPIO`, échouait au lancement :
+
+```
+lgpio.error: 'GPIO not allocated'
+```
+
+Sous Raspberry Pi OS Bookworm, `RPi.GPIO` passe par une couche de compatibilité `lgpio`
+qui ne libère pas correctement les broches lorsqu'un script se termine anormalement. Le
+descripteur survit à l'arrêt du processus.
+
+**Solution :** réécriture avec `gpiozero.DistanceSensor`, bibliothèque native de Bookworm.
+Elle gère le chronométrage des impulsions en interne et libère les broches de manière
+fiable.
+
+**Leçon :** sur Bookworm, `RPi.GPIO` est une bibliothèque héritée émulée. Pour tout nouveau
+code, `gpiozero` est le choix par défaut.
+
+## F3 — Erreur `GPIO busy` survivant au redémarrage
+
+Après la réécriture avec `gpiozero`, l'erreur persistait sous une autre forme :
+
+```
+lgpio.error: 'GPIO busy'
+```
+
+sur GPIO24, la ligne ECHO du capteur gauche. Un redémarrage complet n'y changeait rien, ce
+qui excluait un processus résiduel. `gpioinfo | grep -i used` ne retournait rien.
+
+**Cause :** une ligne ajoutée dans `/boot/firmware/config.txt` plusieurs semaines
+auparavant, lors du dépannage du bus I2C.
+
+```
+dtoverlay=i2c-gpio,bus=3,i2c_gpio_sda=23,i2c_gpio_scl=24
+```
+
+Cet overlay créait un bus I2C logiciel sur GPIO23 et GPIO24, exactement les deux broches du
+capteur gauche. Le noyau réservait ces lignes au démarrage, avant que `gpiozero` ne puisse
+les demander. `gpioinfo` ne l'affichait pas parce que l'overlay réserve les lignes en amont
+de leur exposition par le pilote `gpiochip`.
+
+**Diagnostic reproductible :**
+
+```bash
+grep -v '^#' /boot/firmware/config.txt | grep -v '^$'
+gpioinfo | grep -i used
+```
+
+**Solution :** ligne commentée plutôt que supprimée, afin de conserver la trace de l'essai,
+puis redémarrage.
+
+**Leçon :** une modification de `config.txt` survit à tous les redémarrages et n'apparaît
+dans aucun message d'erreur — l'erreur indique seulement qu'une broche est occupée, jamais
+par quoi. Toute broche affectée à un overlay doit être notée au moment de l'ajout, et
+l'overlay retiré dès la fin de l'essai. C'est le type de résidu de dépannage qui empoisonne
+une session plusieurs semaines plus tard.
+
+## F4 — Minimum local du champ de potentiel
+
+Deux obstacles rapprochés, un de chaque côté, et la décision affichée était « tout droit » :
+
+```
+  10.5  77.3   4.6  |     19     20  |  tout droit
+```
+
+Un obstacle à 4,6 cm à droite, un autre à 10,5 cm à gauche, et le robot avance entre les
+deux.
+
+**Ce n'est pas un bruit de mesure ni une erreur de code.** Les deux distances sont sous
+`D_MIN`, les deux répulsions valent donc exactement la même valeur plafond, et la force
+latérale nette est nulle. Le champ de potentiel ne distingue pas « aucun obstacle » de
+« bloqué symétriquement des deux côtés » : dans les deux cas la résultante est zéro.
+
+C'est le **minimum local**, défaut connu et documenté des méthodes de champ de potentiel.
+L'information manquante est absente de la résultante, donc aucun réglage de gain ne peut
+le corriger.
+
+**Solution :** un critère absolu, indépendant du calcul de forces.
+
+```
+Si une distance quelconque est inférieure à D_PANIQUE, arrêt,
+quel que soit l'équilibre des forces.
+```
+
+`D_PANIQUE` fixé à 15 cm, valeur dérivée de la demi-largeur du châssis.
+
+**Leçon :** une limite mathématique de la méthode choisie ne se corrige pas en ajustant ses
+paramètres. Elle se corrige en ajoutant un critère extérieur à la méthode.
+
+## F5 — Capteurs latéraux sans seuil d'arrêt
+
+Un obstacle stable à 10,5 cm du flanc gauche laissait le robot avancer pendant 1,2 seconde
+avec des consignes de 35 et 4.
+
+Seul le capteur central possédait un seuil d'arrêt. Or un châssis à chenilles de 20 cm de
+large ne peut pas pivoter avec un obstacle à 10 cm de son flanc : la chenille le percute
+avant que le virage soit amorcé.
+
+**Solution :** le seuil de panique de F4 s'applique aux trois capteurs, pas seulement au
+central.
+
+## F6 — Arrêt d'urgence relâché par une mesure aberrante isolée
+
+Trente trames consécutives en arrêt, puis une trame unique relâchant les moteurs vers un
+obstacle à 9,1 cm :
+
+```
+  17.0  20.5   9.1  |      5     34  |  vire a gauche
+```
+
+La décision était recalculée à chaque trame depuis la mesure brute, sans mémoire d'état.
+Une seule lecture aberrante du capteur central — 20,5 cm au lieu des 16 réels — suffisait à
+relâcher l'arrêt pendant 100 ms.
+
+**Solution :** l'arrêt devient un état verrouillé, armé dès la première trame dangereuse et
+relâché seulement après huit trames propres consécutives.
+
+Une première version exigeait deux trames dangereuses pour armer, par prudence contre les
+faux arrêts. C'était un mauvais arbitrage, visible sur les journaux :
+
+```
+   ---  77.7   4.2 |    -13     53  |  vire a gauche
+   ---  77.7   4.2 |      0      0  |  ARRET - obstacle a 4 cm (droite)
+```
+
+Une consigne moteur envoyée pendant 100 ms avec un obstacle à 4,2 cm.
+
+**Leçon :** l'hystérésis d'un état de sécurité doit être asymétrique. Les deux erreurs
+n'ont pas le même coût : un faux arrêt coûte une fraction de seconde, un arrêt manqué coûte
+le châssis. Entrée immédiate, sortie lente.
+
+Une fenêtre de sortie de cinq trames s'est également révélée insuffisante : l'arrêt se
+relâchait à 4/5 alors que l'obstacle était encore présent. Portée à huit après mesure.
+
+## F7 — Diaphonie entre capteurs à ultrasons
+
+Valeurs physiquement impossibles sur un même capteur en trois dixièmes de seconde :
+
+```
+   5.9   6.5  54.5
+   6.5   6.5 ---
+   6.8   6.5 ---
+   6.8   6.8   4.2
+```
+
+Et ailleurs, dix trames consécutives identiques au dixième de centimètre près : `gpiozero`
+renvoie sa dernière valeur en cache lorsqu'aucun écho ne revient.
+
+**Cause :** les trois capteurs émettent presque simultanément dans leurs fils d'exécution
+respectifs. À courte distance, l'impulsion d'un capteur atteint le récepteur d'un autre.
+
+**Solution :** filtre médian sur une fenêtre de cinq échantillons par capteur.
+
+La médiane plutôt que la moyenne : sur la séquence `5,2 → 54,5 → 4,2`, la médiane renvoie
+une valeur plausible, tandis que la moyenne aurait renvoyé 21 cm, c'est-à-dire un obstacle
+inexistant. Une moyenne intègre partiellement une aberration ; une médiane l'élimine
+complètement.
+
+## F8 — Paramètre devenu inatteignable par interaction avec un seuil de sécurité
+
+```
+   ---  76.9  15.2 |      0     39  |  vire a gauche
+```
+
+`D_MIN = 10 cm` plafonnait la force de répulsion, mais `D_PANIQUE = 15 cm` arrêtait le
+robot avant. La plage 15–10 cm était donc inatteignable en mouvement : lorsque la fonction
+de répulsion est appelée, toutes les distances valent au moins 15.
+
+Conséquence : la correction maximale réellement atteignable valait
+
+```
+KP_OBS × (1/15 − 1/60) = KP_OBS × 0,0500
+```
+
+et non la valeur calculée à partir de `D_MIN`, supérieure de deux tiers. Le gain avait été
+dimensionné sur une plage que le seuil de sécurité rendait inaccessible.
+
+**Ce défaut ne produisait aucune anomalie de comportement.** Le robot réagissait
+raisonnablement, simplement avec une correction maximale de 20 au lieu des 33 documentés.
+L'écart entre comportement réel et comportement supposé était invisible sans le calcul
+explicite de la borne.
+
+**Solution :** `D_MIN` aligné sur `D_PANIQUE`, ce qui supprime le code mort, et gain
+recalculé sur la plage réelle.
+
+**Leçon :** deux paramètres corrects isolément peuvent être incompatibles. Chaque fois
+qu'un seuil de sécurité est ajouté, les bornes des calculs existants doivent être
+revérifiées : la sécurité peut rendre une partie du domaine de calcul inatteignable sans
+qu'aucun test ne le signale.
+
 ---
 
 ## Leçons transversales
@@ -580,3 +826,20 @@ de ces valeurs s'est révélée fausse pour ce montage spécifique.
 
 **Une commande d'arrêt n'est pas une commande ordinaire.** Elle exige réémission jusqu'à
 confirmation et repli sur temporisation.
+
+**Une limite de la méthode ne se corrige pas en ajustant ses paramètres.** Le minimum local
+du champ de potentiel ne venait pas d'un mauvais réglage mais de l'absence de l'information
+dans la résultante. Sa correction a demandé un critère extérieur à la méthode.
+
+**Un seuil de sécurité ajouté peut rendre une partie d'un calcul inatteignable.** Deux
+paramètres corrects isolément se sont révélés incompatibles, sans qu'aucune anomalie de
+comportement ne le signale. Après tout ajout d'un seuil, les bornes des calculs existants
+doivent être revérifiées.
+
+**L'hystérésis d'un état de sécurité doit être asymétrique.** Un faux arrêt coûte une
+fraction de seconde, un arrêt manqué coûte le châssis. Entrée immédiate, sortie lente.
+
+**Une modification de configuration système est un résidu durable.** Un overlay ajouté dans
+`config.txt` lors d'un dépannage a bloqué une broche plusieurs semaines plus tard, sans
+apparaître dans aucun message d'erreur. Toute broche réservée par un overlay doit être
+notée à l'ajout et l'overlay retiré dès la fin de l'essai.
