@@ -1,7 +1,7 @@
 # Phase 4 — Évitement d'obstacles réactif
 
-**Statut :** Logique validée en simulation, intégration moteur en attente de matériel
-**Période :** Septembre — Octobre 2026
+**Statut :** Complète
+**Période :** Septembre — Novembre 2026
 **Prérequis :** Phase 3 validée (odométrie et asservissement de cap)
 
 ---
@@ -48,12 +48,13 @@ anomalie de comportement peut provenir des deux niveaux.
 |---|---|---|
 | 1 | Validation matérielle des trois capteurs à ultrasons | Complète |
 | 2 | Logique d'évitement par champ de potentiel | Complète |
-| 3 | Intégration aux moteurs et essais en déplacement | En attente de matériel |
+| 3 | Manœuvre de dégagement et intégration aux moteurs | Complète |
+| 4 | Sélecteur de mode à la manette | Complète |
 
-La Partie 3 est suspendue : le contrôleur moteur Hiwonder a été détruit par une
-défaillance d'alimentation (voir `troubleshooting.md`, partie E). La Partie 2 a donc été
-conduite entièrement en mode simulation, sans actionneurs — ce qui s'est révélé être un
-avantage méthodologique plutôt qu'une contrainte.
+Les Parties 1 et 2 ont été conduites sans actionneurs : le contrôleur moteur Hiwonder
+avait été détruit par une défaillance d'alimentation (voir `troubleshooting.md`, F1), et
+il a fallu dix jours pour le remplacer. Cette contrainte s'est révélée être un avantage
+méthodologique plutôt qu'un obstacle, pour les raisons exposées en fin de document.
 
 ---
 
@@ -375,9 +376,15 @@ Vérification que le robot ne devient pas nerveux au loin :
 | `D_ARRET` | 20 cm | Seuil d'arrêt du capteur central |
 | `BASE_SPEED` | 20 | Vitesse de croisière |
 | `KP_OBS` | 600 | Calibré empiriquement, itération 3 |
+| `POIDS_CENTRE` | 2,0 | Un obstacle de face est sur la trajectoire |
 | `TRAMES_ENTREE` | 1 | Entrée immédiate en arrêt |
 | `TRAMES_SORTIE` | 8 | Mesuré : 5 insuffisant |
 | `FENETRE_MED` | 5 | Filtre médian |
+| `TRAMES_AVANT_DEGAGEMENT` | 3 | Arrêt persistant avant manœuvre |
+| `VITESSE_RECUL` | 15 | Lent, car en aveugle |
+| `TRAMES_RECUL` | 8 | 0,8 s à 10 Hz |
+| `VITESSE_PIVOT` | 35 | Pivot différentiel sur place |
+| `TRAMES_PIVOT` | 7 | 0,7 s à 10 Hz |
 | Période de boucle | 100 ms | 10 Hz |
 
 ## Validation
@@ -400,6 +407,201 @@ Critères vérifiés :
 - Obstacle latéral seul détecté et traité par arrêt
 - Hystérésis effective, aucun relâchement sur mesure aberrante isolée
 - Référence en espace dégagé stable à `20 / 20`
+
+---
+
+# Partie 3 — Manœuvre de dégagement et intégration aux moteurs
+
+## Ce que révèle le premier essai en déplacement
+
+Le contrôleur moteur de remplacement a été reçu le 6 novembre. Le protocole de première
+mise sous tension a été appliqué : LiPo seule sur le port PWR, mesure de la broche 5 V du
+port I2C avant tout raccordement. Carte saine, adresses `0x34` et `0x68` détectées.
+
+Le premier essai en déplacement a montré deux comportements que la simulation ne pouvait
+pas révéler, parce qu'ils ne se lisent pas dans un journal de consignes.
+
+**Le robot paraissait foncer vers un obstacle de face avant de caler.** L'explication est
+dans le calcul. Face à un obstacle frontal, les deux capteurs latéraux ne voient rien :
+leurs répulsions sont nulles, et seule celle du centre agit. À 40 cm elle vaut
+
+```
+600 × (1/40 − 1/60) = 5
+```
+
+soit des consignes de 25 et 15 sur une base de 20. Une inflexion à peine perceptible. Le
+temps que la correction devienne franche, le robot est à 25 cm, et le seuil d'arrêt le
+stoppe à 20.
+
+**Et il ne se dégageait jamais.** Arrivé devant l'obstacle, il s'arrêtait et restait là.
+C'était le comportement programmé — le champ de potentiel ne sait que dévier en avançant,
+le seuil de panique ne sait que stopper — mais un robot qui s'arrête devant un obstacle ne
+l'évite pas : il le constate.
+
+## Correction 1 — pondérer le capteur central
+
+Un obstacle de face est sur la trajectoire. C'est le plus urgent à traiter, et il pesait
+pourtant autant qu'un obstacle latéral qui ne gêne personne.
+
+`POIDS_CENTRE = 2,0` multiplie sa répulsion. À 45 cm, la correction passe de 5 à 13 :
+consignes 26 et 13 au lieu de 25 et 15. Le robot s'écarte bien avant d'arriver au contact.
+
+## Correction 2 — la manœuvre de dégagement
+
+Quand l'arrêt persiste trois trames, l'obstacle ne partira pas de lui-même. Le robot
+recule, pivote vers le côté le plus dégagé, puis repart.
+
+La logique devient une machine à quatre états.
+
+| État | Comportement |
+|---|---|
+| NORMAL | Le champ de potentiel pilote, le robot avance en déviant |
+| ARRET | Un critère de sécurité est actif, consignes nulles |
+| RECUL | Marche arrière à vitesse 15 pendant 0,8 s |
+| PIVOT | Rotation sur place à ±35 pendant 0,7 s |
+
+Le côté du pivot est choisi au moment de l'arrêt, en comparant les deux capteurs
+latéraux : on tourne vers celui qui voit le plus loin.
+
+**Les deux manœuvres ignorent les capteurs pendant leur durée.** C'est délibéré. Une
+manœuvre de dégagement interrompue à mi-course laisse le robot exactement dans la
+situation qu'elle devait résoudre, et il recommencerait indéfiniment.
+
+**Limite assumée : aucun capteur à l'arrière.** Le recul se fait en aveugle. Il est donc
+volontairement court et lent — assez pour dégager le châssis, pas assez pour aller
+percuter ce qui se trouve derrière. Un capteur arrière est la condition pour l'allonger,
+et ce sera le moment de reconsidérer ces deux constantes.
+
+## Séquence obtenue
+
+Approche frontale simulée, puis vérifiée en déplacement :
+
+```
+tout droit                      20 /  20
+vire a droite                   26 /  13
+vire a droite                   40 /   0
+ARRET - obstacle de face         0 /   0
+DEGAGEMENT - recul 1/8         -15 / -15
+   ...
+DEGAGEMENT - recul 8/8         -15 / -15
+DEGAGEMENT - pivot droite 1/7   35 / -35
+   ...
+DEGAGEMENT - pivot droite 7/7   35 / -35
+tout droit                      20 /  20
+```
+
+## Un correctif retiré
+
+Une coupure du connecteur de la LiPo en cours d'essai a fait perdre à la Hiwonder ses
+registres de configuration, volatils. Au retour du courant, la carte interprétait les
+consignes autrement et les moteurs tournaient sans commande.
+
+Une reconfiguration **périodique** a été essayée : réécrire `MOTOR_TYPE` toutes les deux
+secondes pour rendre toute micro-coupure invisible. Elle a dégradé le comportement dans
+les deux modes et a été retirée.
+
+La cause est claire rétrospectivement. Réécrire le registre de type moteur pendant que
+les moteurs tournent demande au contrôleur de reconfigurer son étage de puissance en
+pleine marche. Rien ne garantit qu'il encaisse cette opération proprement. Le correctif
+introduisait une perturbation régulière pour compenser une perturbation occasionnelle.
+
+Seule la reconfiguration **réactive** a été conservée : sur échec avéré d'écriture I2C,
+le script reconfigure la carte avant la commande suivante. Et le vrai correctif d'une
+alimentation intermittente reste le connecteur, pas le logiciel.
+
+**Leçon :** un correctif logiciel qui compense un défaut matériel doit être évalué sur
+son effet global, pas seulement sur le symptôme qu'il vise. Celui-ci corrigeait un
+problème rare en en créant un permanent.
+
+---
+
+# Partie 4 — Sélecteur de mode à la manette
+
+## Objet
+
+Jusqu'ici, la téléopération et l'évitement autonome étaient deux scripts distincts, lancés
+séparément. Deux démonstrations, pas un système.
+
+Le sélecteur de mode les réunit : un bouton de la manette choisit qui commande les
+moteurs, sans rien relancer.
+
+| Bouton | Mode | Qui commande |
+|---|---|---|
+| A | Téléopération | Le joystick, relayé tel quel |
+| B | Autonome | La logique d'évitement, sur le Raspberry Pi |
+| Y | Arrêt | Personne, consignes nulles |
+
+## Choix de conception
+
+**Trois boutons distincts plutôt qu'une bascule sur un seul.** Avec une bascule, l'état
+demandé dépend de l'historique : une pression non enregistrée inverse la signification de
+toutes les suivantes, et on ne le découvre qu'au moment où le robot part dans le mauvais
+mode. Avec trois boutons, l'état demandé est toujours explicite.
+
+**Détection sur front montant.** Sans cela, un appui maintenu de 200 ms réémettrait le
+changement de mode dix fois de suite.
+
+**Mode arrêt au démarrage.** Rien ne bouge avant une action délibérée.
+
+**Un seul format de trame.** La trame passe de `L,R` à `M,L,R`. En mode arrêt et en mode
+autonome, L et R valent toujours 0 — c'est le Raspberry Pi qui calcule les consignes en
+autonome. Garder le champ évite d'avoir deux formats à analyser.
+
+## Sécurités
+
+Deux replis indépendants ramènent le robot à l'arrêt.
+
+**Côté ESP32 :** toute déconnexion de la manette force le mode arrêt et réémet
+périodiquement `0,0,0`, pour que l'ordre passe même si une trame se perd.
+
+**Côté Raspberry Pi :** si aucune trame valide n'arrive pendant 300 ms, repli en arrêt.
+L'absence de nouvelle n'est jamais interprétée comme « continue comme avant ». La manette
+ou l'ESP32 peuvent se taire sans prévenir.
+
+Un changement de mode arrête d'abord les moteurs et réinitialise le verrou d'évitement :
+au retour en autonome, l'état d'arrêt ne doit pas être hérité d'une situation qui n'existe
+plus.
+
+## Dérive du joystick
+
+Au repos, le robot tournait sur lui-même de façon intermittente. Les consignes affichées
+étaient `G = 19, D = -19`, parfaitement opposées — une rotation pure, donc `linear = 0` et
+`angular = -19`.
+
+La conversion va de ±32768 vers ±100, ce qui situe la valeur brute à
+
+```
+19 × 32768 / 100 ≈ 6226
+```
+
+pour une zone morte de 6000. Le joystick reposait à 226 unités au-delà du seuil, soit 3 %
+de dépassement.
+
+Ce n'est pas un défaut de code : le point de repos d'un stick Xbox dérive avec l'usage, la
+température et la façon dont on le relâche. La calibration, elle, n'avait lieu qu'une
+fois, à la connexion de la manette.
+
+Deux corrections. La zone morte passe de 6000 à 9000, ce qui couvre la dérive observée
+avec une marge. Et le bouton Y déclenche désormais une **recalibration** en plus de
+l'arrêt : c'est précisément le moment où le robot est immobile et le joystick censé être
+libre. Une calibration faite une seule fois finit par mentir ; une calibration qu'on peut
+refaire d'un bouton, non.
+
+## Écriture de la consigne moteur
+
+Une première version n'écrivait la consigne I2C **que lorsqu'elle changeait**, pour ne pas
+saturer le bus. Les moteurs ne tournaient pas.
+
+La consigne est maintenant réécrite toutes les 50 ms, comme le fait `test_motors.py`, qui
+fonctionne. Le registre de vitesse de la Hiwonder se réécrit sans coût notable, et une
+écriture perdue est rattrapée au cycle suivant.
+
+**Leçon :** une optimisation qui supprime la redondance supprime aussi la tolérance aux
+pannes. Sur une commande d'actionneur, la redondance n'est pas du gaspillage.
+
+Un second défaut tenait au masque. Le registre attend des octets de 0 à 255, et une
+consigne négative — marche arrière, ou chenille inversée en évitement — sort de cette
+plage. `test_motors.py` appliquait `& 0xFF`, le dispatcher non.
 
 ---
 
@@ -444,6 +646,17 @@ plusieurs centaines de trames, et non de l'inspection du code. Le mode simulatio
 par une panne matérielle, est ce qui a rendu cette lecture possible : un robot en mouvement
 n'aurait montré qu'une collision, sans indiquer laquelle des causes possibles était en jeu.
 
+Le passage aux moteurs a ensuite révélé ce que la simulation ne pouvait pas voir, et la
+distinction mérite d'être posée. La simulation valide la **décision** : elle montre ce que
+le robot déciderait, trame par trame, et c'est là qu'on attrape un calcul faux ou une borne
+inatteignable. Le déplacement valide la **suffisance** de cette décision : une correction
+peut être correctement calculée et malgré tout arriver trop tard, ou laisser le robot dans
+une impasse dont rien ne le sort. Aucun des deux essais ne remplace l'autre.
+
+Enfin, la reconfiguration périodique retirée en Partie 3 illustre un piège distinct : un
+correctif logiciel visant un défaut matériel doit être jugé sur son effet global, pas sur
+le symptôme qu'il vise. Celui-ci supprimait un problème rare en en créant un permanent.
+
 ---
 
 ## Scripts associés
@@ -451,11 +664,24 @@ n'aurait montré qu'une collision, sans indiquer laquelle des causes possibles �
 | Fichier | Rôle |
 |---|---|
 | `scripts/phase4/test_hcsr04_triple.py` | Validation matérielle des trois capteurs |
-| `scripts/phase4/obstacle_logic_test.py` | Logique d'évitement, mode simulation |
+| `scripts/phase4/evitement.py` | Module : constantes, filtrage, machine d'états |
+| `scripts/phase4/obstacle_logic_test.py` | Réglage en simulation, sans moteurs |
+| `scripts/phase4/mode_receiver.py` | Sélecteur de mode, programme principal |
+| `firmware/esp32/src/main.cpp` | Manette, sélection du mode, affichage, UART |
+
+Les constantes ne vivent qu'à un seul endroit, dans `evitement.py`. Le réglage trouvé en
+simulation est donc automatiquement celui qui pilote le robot : deux copies finiraient par
+diverger, et on ne saurait plus laquelle tourne.
+
+`evitement.py` est un module, jamais exécuté seul. Il doit se trouver dans le même dossier
+que les deux scripts qui l'importent.
 
 ## Suite
 
-La Partie 3 — intégration aux moteurs et essais en déplacement — reprendra à la réception
-du contrôleur moteur de remplacement. Le protocole de première mise sous tension figure
-dans `hardware.md` : mesure de la broche 5 V du port I2C avant tout raccordement, une
-tension de 7 V signalant une carte défectueuse à l'arrivée.
+La Phase 5 donne un but au robot : atteindre des coordonnées cibles. C'est là que les trois
+phases précédentes se composent — l'odométrie de la Phase 3 dit où il est, un cap visé dit
+où aller, et l'évitement de la Phase 4 s'intercale en priorité quand quelque chose bloque.
+
+C'est aussi là que se traite la limite décrite ci-dessus. Avec un cap visé, l'évitement
+devient une déviation autour d'un objectif plutôt qu'une réaction sans mémoire, et le robot
+reprend sa route au lieu de rebondir le long d'une paroi.
