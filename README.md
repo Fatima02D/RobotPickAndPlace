@@ -1,7 +1,7 @@
 # Robot Mobile Autonome — Pick & Place
 
 **Auteure :** Saida Fatimatou Zahraa Diouf
-**Programme :** B.Ing Génie Mécatronique, UQTR
+
 **Dépôt :** github.com/fatima02d/RobotPickAndPlace
 
 ---
