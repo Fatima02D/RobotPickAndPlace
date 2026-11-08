@@ -5,6 +5,13 @@
 
 ---
 
+## Philosophie
+
+En ingénierie, un problème n'est pas un échec. C'est une donnée. Chaque obstacle
+rencontré ici a mené à une meilleure décision.
+
+---
+
 # Partie A — Plateforme 2WD, plaque en bois (Janvier 2026)
 
 ## A1 — Moteurs immobiles au départ
@@ -801,6 +808,247 @@ qu'un seuil de sécurité est ajouté, les bornes des calculs existants doivent 
 revérifiées : la sécurité peut rendre une partie du domaine de calcul inatteignable sans
 qu'aucun test ne le signale.
 
+# Partie G — Phase 4, intégration moteur et outillage (Novembre 2026)
+
+## G1 — Redémarrage en boucle causé par une broche réservée à la flash
+
+Après téléversement, l'ESP32 redémarrait indéfiniment. Le moniteur série n'affichait que
+le message du bootloader ROM, répété plusieurs fois par seconde :
+
+```
+ESP-ROM:esp32s3-20210327
+rst:0x8 (TG1WDT_SYS_RST),boot:0x29 (SPI_FAST_FLASH_BOOT)
+```
+
+Aucune ligne du programme n'apparaissait, pas même le premier `Serial.println` de
+`setup()`. Le plantage survenait donc avant toute exécution utile.
+
+**Cause :** `RPI_RX` était défini sur **GPIO27**. Sur ESP32-S3, les broches GPIO26 à
+GPIO32 sont câblées en interne vers la mémoire flash et la PSRAM. Le journal de
+compilation le confirmait — `Features: WiFi, BLE, Embedded PSRAM 8MB` — et le bootloader
+affichait `SPIWP:0xee`, qui désigne GPIO28. Configurer GPIO27 en entrée UART revient à
+réquisitionner une ligne du bus flash pendant que la puce l'utilise. Le chip plante au
+premier accès flash, le chien de garde redémarre, et le cycle recommence.
+
+**Origine de l'erreur :** GPIO2 avait été écarté au motif qu'il s'agit d'une broche de
+configuration dont l'état au démarrage peut empêcher le boot. C'est exact sur l'ESP32
+classique, faux sur le S3, dont les strapping pins sont GPIO0, GPIO3, GPIO45 et GPIO46.
+Une contrainte réelle avait été appliquée à la mauvaise puce, et une broche valable
+remplacée par une broche interdite.
+
+**Solution :** retour à `RPI_RX = 2`.
+
+**Diagnostic reproductible :** `rst:0x8 (TG1WDT_SYS_RST)` en boucle, sans aucune sortie du
+programme, oriente vers une faute matérielle d'initialisation — broche réservée, bus
+réquisitionné — et non vers une erreur de logique.
+
+**Leçon :** vérifier la liste des broches réservées de la puce exacte avant d'en choisir
+une, et ne jamais transposer une contrainte d'une variante à une autre.
+
+## G2 — Aucune sortie série sur le port USB
+
+Même une fois le programme fonctionnel, aucun `Serial.println` n'apparaissait dans le
+moniteur, alors que les messages du bootloader passaient.
+
+**Cause :** sur ESP32-S3, `Serial` est dirigé par défaut vers UART0, c'est-à-dire les
+broches GPIO43 et GPIO44. Le port USB natif est un périphérique distinct. Tout ce que le
+programme écrivait partait sur des broches que personne n'écoutait.
+
+**Solution :** ajouter dans `platformio.ini` :
+
+```ini
+build_flags =
+    -DARDUINO_USB_CDC_ON_BOOT=1
+```
+
+**Leçon :** sans sortie série, le diagnostic est aveugle. Ce drapeau mérite d'être posé
+dès la création d'un projet S3, avant d'en avoir besoin.
+
+## G3 — Téléversement sur un port Bluetooth
+
+Le téléversement échouait après 45 secondes d'attente :
+
+```
+Using manually specified: COM6
+A fatal error occurred: Could not open COM6, the port is busy or doesn't exist.
+(OSError(22, 'Le délai de temporisation de sémaphore a expiré.', None, 121))
+```
+
+**Cause :** COM6 est un port série virtuel Bluetooth. L'ESP32 est sur COM8. Le message
+est trompeur : le port existe bien, mais rien n'est au bout, et Windows attend l'expiration
+d'un délai Bluetooth avant d'abandonner.
+
+**Identification des ports :**
+
+```
+C:\Users\HP\.platformio\penv\Scripts\platformio.exe device list
+```
+
+| Port | Description | Nature |
+|---|---|---|
+| COM3 | Intel AMT - SOL | Interne |
+| COM6, COM7 | Lien série sur Bluetooth standard | Virtuels |
+| COM8 | Périphérique série USB, `VID:PID=303A:1001` | L'ESP32 |
+
+`303A` est le code constructeur d'Espressif.
+
+**Origine :** le port était mémorisé dans les **paramètres utilisateur de VS Code**, sous
+la clé `platformio-ide.customPort`, et non dans le projet. Le dossier `.vscode` ne
+contenait aucun `settings.json`, ce qui a rendu la recherche trompeuse. L'extension passe
+ce port en ligne de commande, où il écrase le `upload_port` de `platformio.ini`.
+
+**Solutions :** corriger `platformio-ide.customPort` dans les paramètres utilisateur, ou
+spécifier le port à la main, ce qui contourne entièrement le réglage mémorisé :
+
+```
+C:\Users\HP\.platformio\penv\Scripts\platformio.exe run --target upload --upload-port COM8
+```
+
+**Leçon :** un réglage passé en ligne de commande l'emporte toujours sur un fichier de
+configuration. Chercher la valeur fautive dans le fichier était une impasse.
+
+## G4 — Extension PlatformIO partiellement chargée
+
+Symptômes simultanés : aucune icône PlatformIO dans la barre latérale, pas de barre bleue
+en bas, et `command 'platformio-ide.upload' not found` depuis la palette, alors que
+d'autres commandes PlatformIO y figuraient.
+
+**Cause :** une notification le disait — `Extension host terminated unexpectedly 3 times
+within the last 5 minutes`. Le processus qui exécute les extensions plantait en boucle.
+L'extension enregistrait les commandes ne dépendant que d'elle-même, mais pas celles
+nécessitant PlatformIO Core.
+
+**Contournement :** le terminal intégré et la ligne de commande ne dépendent d'aucune
+extension. Tout le travail a pu continuer par là.
+
+**Réparation :** `Developer: Reload Window` depuis la palette.
+
+**Leçon :** quand l'interface d'un outil défaille, la ligne de commande sous-jacente reste
+disponible. Identifier cette voie de secours évite de confondre une panne d'interface avec
+une panne de chaîne de compilation.
+
+## G5 — Terminal WSL incapable de téléverser
+
+Tentative de téléversement depuis le terminal Ubuntu intégré :
+
+```
+C:UsersHP.platformiopenvScriptsplatformio.exe: command not found
+```
+
+**Deux causes superposées.** Bash interprète l'antislash comme caractère d'échappement :
+le chemin Windows a perdu tous ses séparateurs. Et plus fondamentalement, WSL ne voit pas
+les ports COM de Windows — une tentative antérieure avait déjà donné
+`Could not open /dev/ttyS0`.
+
+**Solution :** le téléversement se fait depuis PowerShell. Dans le panneau TERMINAL de
+VS Code, la flèche à côté du `+` permet de choisir le type de terminal ; l'invite doit
+commencer par `PS C:\` et non `ubuntu@`.
+
+## G6 — Les moteurs ne tournaient pas depuis le dispatcher
+
+`test_motors.py` faisait tourner les moteurs, `mode_receiver.py` non, alors que les
+consignes s'affichaient correctement.
+
+**Deux causes.**
+
+La consigne n'était écrite **que lorsqu'elle changeait**, pour ne pas saturer le bus. Une
+écriture perdue ou échouée n'était alors jamais réémise. `test_motors.py`, qui fonctionne,
+écrit et maintient.
+
+Et le masque manquait. Le registre attend des octets de 0 à 255 ; une consigne négative —
+marche arrière, ou chenille inversée en évitement — sort de cette plage et `smbus2` refuse
+l'écriture. `test_motors.py` appliquait `& 0xFF`, le dispatcher non.
+
+**Solution :** réécriture de la consigne toutes les 50 ms, et application du masque.
+
+**Leçon :** une optimisation qui supprime la redondance supprime aussi la tolérance aux
+pannes. Sur une commande d'actionneur, la redondance n'est pas du gaspillage. Et quand
+deux scripts pilotent le même matériel et qu'un seul fonctionne, la comparaison ligne à
+ligne est plus rapide que le raisonnement.
+
+## G7 — Reconfiguration périodique aggravant le comportement
+
+Une coupure du connecteur de la LiPo fait perdre à la Hiwonder ses registres de
+configuration, volatils. Au retour du courant, la carte interprète les consignes autrement
+et les moteurs tournent sans commande.
+
+Une reconfiguration **périodique** a été ajoutée : réécrire `MOTOR_TYPE` toutes les deux
+secondes. Le comportement s'est dégradé dans les deux modes, téléopération comprise.
+
+**Cause :** réécrire le registre de type moteur pendant que les moteurs tournent demande
+au contrôleur de reconfigurer son étage de puissance en pleine marche. Le correctif
+introduisait une perturbation régulière pour compenser une perturbation occasionnelle.
+
+**Solution :** retrait. Seule la reconfiguration réactive, déclenchée par un échec avéré
+d'écriture I2C, est conservée. Le vrai correctif d'une alimentation intermittente est le
+connecteur.
+
+**Méthode de diagnostic utile :** le symptôme touchait les deux modes. Comme une seule
+modification récente agissait sur les deux, elle était identifiable sans essais.
+
+**Leçon :** un correctif logiciel visant un défaut matériel doit être jugé sur son effet
+global, pas sur le symptôme qu'il vise.
+
+## G8 — Rotation lente au repos en téléopération
+
+Joystick relâché, le robot tournait sur lui-même. Le Raspberry Pi affichait :
+
+```
+[TELEOPERATION]  G :   19   D :  -19
+```
+
+Valeurs parfaitement opposées : rotation pure, donc composante longitudinale nulle et
+composante angulaire de -19.
+
+**Calcul :** la conversion va de ±32768 vers ±100, ce qui situe la valeur brute à
+
+```
+19 × 32768 / 100 ≈ 6226
+```
+
+pour une zone morte de 6000. Le joystick reposait 226 unités au-delà du seuil, soit 3 %
+de dépassement.
+
+**Cause :** le point de repos d'un stick Xbox dérive avec l'usage, la température et la
+façon dont on le relâche. La calibration n'avait lieu qu'une fois, à la connexion de la
+manette.
+
+**Solutions :** zone morte portée de 6000 à 9000, et recalibration déclenchée par le
+bouton Y — qui met déjà le robot à l'arrêt, donc au moment précis où le joystick est censé
+être libre.
+
+**Leçon :** une calibration faite une seule fois finit par mentir. Prévoir un moyen de la
+refaire sans redémarrer coûte quelques lignes.
+
+**Méthode de diagnostic :** le test décisif a été de passer en mode arrêt. Les chenilles
+s'immobilisaient, ce qui éliminait d'un coup le contrôleur moteur, le bus I2C et le
+câblage, et désignait la source des consignes.
+
+## G9 — Fichier dupliqué par collage dans nano
+
+Un script faisait exactement le double de sa taille attendue, et `grep` trouvait deux fois
+chaque définition.
+
+**Cause :** `nano` sur un fichier existant ouvre son contenu avec le curseur en haut.
+Coller insère sans rien supprimer. Le fichier contenait deux copies successives du script,
+et Python exécutait la première puis la seconde.
+
+**Solution :** vider le fichier avant d'ouvrir l'éditeur.
+
+```bash
+> ~/script.py
+nano ~/script.py
+```
+
+**Vérification systématique après un collage :**
+
+```bash
+wc -c ~/script.py
+```
+
+La taille doit correspondre à celle du fichier source, à un octet près. Un écart d'un
+facteur deux signale une duplication, un écart important une troncature.
+
 ---
 
 ## Leçons transversales
@@ -843,3 +1091,22 @@ fraction de seconde, un arrêt manqué coûte le châssis. Entrée immédiate, s
 `config.txt` lors d'un dépannage a bloqué une broche plusieurs semaines plus tard, sans
 apparaître dans aucun message d'erreur. Toute broche réservée par un overlay doit être
 notée à l'ajout et l'overlay retiré dès la fin de l'essai.
+
+**Un correctif logiciel visant un défaut matériel se juge sur son effet global.** La
+reconfiguration périodique de la Hiwonder supprimait un problème rare en en créant un
+permanent.
+
+**La redondance n'est pas du gaspillage sur une commande d'actionneur.** Supprimer la
+réécriture d'une consigne inchangée supprime aussi la tolérance aux écritures perdues.
+
+**Une contrainte vraie pour une puce ne l'est pas pour sa variante.** Une broche de
+configuration de l'ESP32 classique n'en est pas une sur le S3, et une broche libre sur
+l'un peut être réservée à la flash sur l'autre.
+
+**Un réglage passé en ligne de commande l'emporte sur un fichier de configuration.**
+Chercher une valeur fautive dans le fichier alors qu'elle vient de l'appelant est une
+impasse.
+
+**Isoler par élimination avant de modifier quoi que ce soit.** Passer en mode arrêt a
+éliminé en dix secondes le contrôleur moteur, le bus I2C et le câblage, là où une
+hypothèse logicielle aurait demandé plusieurs essais.
